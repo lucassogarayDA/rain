@@ -1,0 +1,14 @@
+mode = "completo"
+
+dependencies = [
+    "androidx.activity:activity-compose:1.8.2",
+    "androidx.compose.material3:material3-android:1.5.0-beta01",
+]
+
+[project]
+name = "LiquidGlassMusicPlayer"
+package = "com.kyant.liquidglass.music"
+version = "1.0"
+
+[build]
+debug = true

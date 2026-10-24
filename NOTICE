@@ -3,3 +3,26 @@ Copyright 2026 Lucas Sogaray
 
 This product includes software developed at
 The Apache Software Foundation (http://www.apache.org/).
+
+---
+
+Rain incluye código adaptado de otros proyectos:
+
+  android2apk — ejemplos "compose" y "neko" (examples/)
+  https://github.com/lucassogarayDA/android2apk
+  Licencia: Apache License 2.0
+
+  Los ejemplos de examples/compose y examples/neko están portados de los
+  ejemplos homónimos de android2apk. Se han adaptado al rain.toml de Rain
+  (layout plano bajo app/ y dependencias declaradas en TOML); el código Kotlin
+  es el original.
+
+  buddy-android — linux/android-app
+  https://github.com/ghorbelhamdi/buddy-android
+  Licencia: Apache License 2.0
+
+El texto íntegro de la licencia está en el fichero LICENSE.
+
+---
+NOTICE: requerido por la sección 4(c) de la Apache License 2.0. Si distribuyes este
+proyecto (o un derivado), conserva este fichero junto con la licencia.
