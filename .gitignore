@@ -1,7 +1,14 @@
 libs/
 cache/
 app/build/
+# Los directorios "build/" de los módulos (app/build de cada ejemplo) son
+# artefactos, pero "internal/build/" es código fuente: por eso el patrón
+# lleva el ancla "**/" y se re-incluye explícitamente el paquete de Go.
+**/build/
+!internal/build/
+.rain-deps/
 *.apk
 *.keystore
 *.jar
 rain
+rain-baseline

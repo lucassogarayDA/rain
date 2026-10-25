@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Nota musical de cristal: la misma silueta que el icono de reproducción de
+     la app. Todo vectorial, sin recursos raster. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Corchea. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M50,33h7v33h-7z" />
+    <path
+        android:fillColor="#FFE7E6FF"
+        android:pathData="M57,33l17,-6v10l-17,6z" />
+
+    <!-- Cabeza de la nota. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M49,67m-11,0a11,11 0,1 0,22 0a11,11 0,1 0,-22 0" />
+
+    <!-- Reflejo del cristal. -->
+    <path
+        android:fillColor="#66FFFFFF"
+        android:pathData="M52,35h2v29h-2z" />
+    <path
+        android:fillColor="#33FFFFFF"
+        android:pathData="M44,67a5,5 0,1 0,10 0a5,5 0,1 0,-10 0" />
+</vector>

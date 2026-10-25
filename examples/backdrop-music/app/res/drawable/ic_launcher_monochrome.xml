@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Capa monocroma para los iconos temáticos de Android 13+. El sistema usa
+     solo el canal alfa, así que el color es indiferente. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M50,33h7v33h-7z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M57,33l17,-6v10l-17,6z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M49,67m-11,0a11,11 0,1 0,22 0a11,11 0,1 0,-22 0" />
+</vector>

@@ -1,0 +1,195 @@
+name: CI and Release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test y Verificación del CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Descargar módulos
+        run: go mod download
+
+      - name: Compilar binario
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Ejecutar Tests
+        run: go test ./...
+
+      - name: Probar Comandos del Binario
+        run: |
+          go build -o rain .
+          ./rain version
+          ./rain doctor
+          ./rain check --help
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.5.0
+
+  build-and-test-examples:
+    name: Build de Ejemplos con Rain
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Instalar JDK 17
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jdk unzip
+
+      - name: Compilar binario rain
+        run: go build -trimpath -o rain .
+
+      - name: Instalar toolchain (aapt2, R8, apksigner, android.jar, kotlinc)
+        run: ./rain doctor --fix --profile complex
+
+      - name: Compilar Ejemplo Compose (FireIcon)
+        working-directory: examples/compose
+        run: ../../rain build
+
+      - name: Verificar APK Compose
+        working-directory: examples/compose
+        run: |
+          set -eu
+          APK=app/build/app-debug.apk
+          test -f "$APK"
+          unzip -l "$APK" | grep -q 'classes.dex'
+          unzip -l "$APK" | grep -q 'resources.arsc'
+          java -jar ~/.rain/toolchain/apksigner.jar verify --verbose "$APK" | head -3
+
+      - name: Compilar Ejemplo Liquid Glass Music Player
+        working-directory: examples/liquid-glass
+        run: ../../rain build
+
+      - name: Verificar APK Liquid Glass Music Player
+        working-directory: examples/liquid-glass
+        run: |
+          set -eu
+          APK=app/build/app-debug.apk
+          test -f "$APK"
+          unzip -l "$APK" | grep -q 'classes.dex'
+          unzip -l "$APK" | grep -q 'resources.arsc'
+          java -jar ~/.rain/toolchain/apksigner.jar verify --verbose "$APK" | head -3
+
+      - name: Comprobar Ejemplo Backdrop Music (MediaStore + backdrop)
+        working-directory: examples/backdrop-music
+        run: ../../rain check
+
+      - name: Compilar Ejemplo Layout Plano (Hello Buddy)
+        working-directory: examples/hello-buddy
+        run: ../../rain build
+
+      - name: Verificar APK Layout Plano
+        working-directory: examples/hello-buddy
+        run: |
+          set -eu
+          APK=build/app-debug.apk
+          test -f "$APK"
+          unzip -l "$APK" | grep -q 'classes.dex'
+          unzip -l "$APK" | grep -q 'resources.arsc'
+          java -jar ~/.rain/toolchain/apksigner.jar verify --verbose "$APK" | head -3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apks-ejemplos
+          path: |
+            examples/compose/app/build/app-debug.apk
+            examples/liquid-glass/app/build/app-debug.apk
+            examples/hello-buddy/build/app-debug.apk
+
+  release:
+    name: Publicación de Release
+    needs: build-and-test-examples
+    if: (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'release') && !contains(github.event.head_commit.message, '[skip release]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configurar git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Calcular siguiente versión
+        id: ver
+        run: |
+          if ./scripts/next-version.sh --bump; then
+            version="$(./scripts/next-version.sh)"
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
+            echo "bump=true" >> "$GITHUB_OUTPUT"
+            echo "Siguiente versión: ${version}"
+          else
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+            echo "Sin cambios desde el último tag: no se crea release."
+          fi
+
+      - uses: actions/setup-go@v5
+        if: steps.ver.outputs.bump == 'true'
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Compilar binarios estáticos (linux amd64/arm64)
+        if: steps.ver.outputs.bump == 'true'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          COMMIT="$(git rev-parse --short HEAD)"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}"
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH="${arch}" CGO_ENABLED=0 \
+              go build -trimpath -ldflags "${LDFLAGS}" -o "rain-linux-${arch}" .
+          done
+          sha256sum rain-linux-* > SHA256SUMS
+
+      - name: Crear tag anotado
+        if: steps.ver.outputs.bump == 'true'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          git tag -a "${VERSION}" -m "Release ${VERSION}"
+          git push origin "${VERSION}"
+
+      - name: Publicar release
+        if: steps.ver.outputs.bump == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.version }}
+          name: ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          files: |
+            rain-linux-amd64
+            rain-linux-arm64
+            SHA256SUMS

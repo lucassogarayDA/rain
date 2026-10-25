@@ -1,0 +1,17 @@
+mode = "completo"
+
+dependencies = [
+    "androidx.activity:activity-compose:1.8.2",
+    "androidx.compose.material3:material3-android:1.5.0-beta01",
+    "androidx.compose.material:material-icons-extended:1.7.8",
+    "io.github.kyant0:backdrop:2.0.1",
+]
+
+[project]
+name = "BackdropMusic"
+package = "com.kyant.backdrop.music"
+version = "1.0"
+
+[build]
+min_sdk = 26
+target_sdk = 36
