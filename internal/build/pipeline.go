@@ -44,12 +44,20 @@ var files []string
 resDir := filepath.Join(appDir, "src/main/res")
 manifest := filepath.Join(appDir, "src/main/AndroidManifest.xml")
 
-filepath.Walk(resDir, func(path string, info os.FileInfo, err error) error {
+if err := filepath.Walk(resDir, func(path string, info os.FileInfo, err error) error {
+if err != nil {
+return err
+}
+if info == nil {
+return fmt.Errorf("información de archivo vacía para %s", path)
+}
 if !info.IsDir() {
 files = append(files, path)
 }
 return nil
-})
+}); err != nil {
+return "", fmt.Errorf("recorriendo recursos %s: %w", resDir, err)
+}
 if _, err := os.Stat(manifest); err == nil {
 files = append(files, manifest)
 }
@@ -108,10 +116,14 @@ return fmt.Sprintf("%x", global.Sum(nil)), nil
 
 func Run(cfg Config) error {
 start := time.Now()
-os.MkdirAll(cfg.BuildDir, 0755)
+if err := os.MkdirAll(cfg.BuildDir, 0755); err != nil {
+return fmt.Errorf("creando directorio de build: %w", err)
+}
 
 genDir := filepath.Join(cfg.BuildDir, "gen")
-os.MkdirAll(genDir, 0755)
+if err := os.MkdirAll(genDir, 0755); err != nil {
+return fmt.Errorf("creando directorio generado: %w", err)
+}
 
 // --- Recursos ---
 resHashPath := filepath.Join(cfg.BuildDir, ".rain-res-hash")
@@ -130,7 +142,16 @@ ui.Info("recursos sin cambios, reutilizando APK base")
 } else {
 ui.Info("compilando recursos...")
 resDir := filepath.Join(cfg.AppDir, "src/main/res")
-os.MkdirAll(flatDir, 0755)
+
+// El directorio contiene exclusivamente salidas de aapt2 compile.
+// Se limpia antes de recompilar para que recursos eliminados o renombrados
+// no permanezcan como archivos .flat obsoletos en el siguiente enlace.
+if err := os.RemoveAll(flatDir); err != nil {
+return fmt.Errorf("limpiando recursos compilados: %w", err)
+}
+if err := os.MkdirAll(flatDir, 0755); err != nil {
+return fmt.Errorf("creando directorio de recursos compilados: %w", err)
+}
 
 cmd := exec.Command("aapt2", "compile", "--dir", resDir, "-o", flatDir)
 cmd.Stdout = os.Stdout
@@ -143,7 +164,10 @@ ui.Info("enlazando recursos...")
 manifest := filepath.Join(cfg.AppDir, "src/main/AndroidManifest.xml")
 args := []string{"link", "-o", baseApk, "-I", cfg.AndroidJar,
 "--manifest", manifest, "--java", genDir}
-entries, _ := os.ReadDir(flatDir)
+entries, err := os.ReadDir(flatDir)
+if err != nil {
+return fmt.Errorf("leyendo recursos compilados: %w", err)
+}
 for _, e := range entries {
 if strings.HasSuffix(e.Name(), ".flat") {
 args = append(args, filepath.Join(flatDir, e.Name()))
@@ -155,7 +179,9 @@ cmd.Stderr = os.Stderr
 if err := cmd.Run(); err != nil {
 return fmt.Errorf("aapt2 link: %w", err)
 }
-os.WriteFile(resHashPath, []byte(currentResHash), 0644)
+if err := os.WriteFile(resHashPath, []byte(currentResHash), 0644); err != nil {
+return fmt.Errorf("guardando hash de recursos: %w", err)
+}
 }
 
 // --- Generar BuildConfig.java ---
