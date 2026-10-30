@@ -5,7 +5,6 @@ import (
 "fmt"
 "os"
 "path/filepath"
-	"strings"
 
 "rain/internal/build"
 "rain/internal/config"
@@ -92,38 +91,14 @@ if err != nil {
 ui.Warn("No se pudo leer rain.toml (%v). Usando modo manual.", err)
 }
 
-// Verificar si hay que descargar dependencias comprobando cada JAR esperado
-needFetch := false
+// Resolver siempre el grafo completo para no omitir dependencias transitivas
+// cuando los JAR de primer nivel ya existen en libs.
 if len(cfg.Dependencies) > 0 {
-// Verificar que al menos el primer nivel de dependencias tenga sus JARs
-for _, dep := range cfg.Dependencies {
-parts := strings.Split(dep, ":")
-if len(parts) != 3 {
-continue
-}
-artifact := parts[1]
-// Buscar cualquier archivo en libs que contenga el nombre del artefacto
-found := false
-entries, _ := os.ReadDir("libs")
-for _, e := range entries {
-if strings.Contains(e.Name(), artifact) && strings.HasSuffix(e.Name(), ".jar") {
-found = true
-break
-}
-}
-if !found {
-needFetch = true
-break
-}
-}
-}
-
-if needFetch {
-ui.Info("Resolviendo y descargando dependencias...")
-if err := resolveAndFetchWithProgress(cfg, "libs"); err != nil {
-ui.Error("Resolviendo dependencias: %v", err)
-os.Exit(1)
-}
+	ui.Info("Resolviendo y descargando dependencias...")
+	if err := resolveAndFetchWithProgress(cfg, "libs"); err != nil {
+		ui.Error("Resolviendo dependencias: %v", err)
+		os.Exit(1)
+	}
 }
 
 // Determinar módulos
@@ -151,33 +126,35 @@ os.Exit(1)
 }
 
 func resolveAndFetchWithProgress(cfg config.Config, libsDir string) error {
-var allCoords []string
-seen := make(map[string]bool)
+	var allCoords []string
 
-for _, dep := range cfg.Dependencies {
-if cfg.Mode == "completo" {
-deps, err := pom.ResolveTransitive(dep, "cache")
-if err != nil { return fmt.Errorf("resolviendo %s: %w", dep, err) }
-for _, d := range deps {
-coord := d.Coordinate()
-if !seen[coord] { seen[coord] = true; allCoords = append(allCoords, coord) }
-}
-}
-if !seen[dep] { seen[dep] = true; allCoords = append(allCoords, dep) }
-}
+	if cfg.Mode == "completo" {
+		resolved, err := pom.ResolveTransitives(cfg.Dependencies, "cache")
+		if err != nil {
+			return fmt.Errorf("resolviendo árbol de dependencias: %w", err)
+		}
+		for _, dep := range resolved {
+			allCoords = append(allCoords, dep.Coordinate())
+		}
+	} else {
+		allCoords = append(allCoords, cfg.Dependencies...)
+	}
 
-if len(allCoords) == 0 { return nil }
+	if len(allCoords) == 0 {
+		return nil
+	}
 
-pb := ui.NewProgressBar(len(allCoords), "Descargando ")
-for i, coord := range allCoords {
-pb.Current = i + 1
-pb.Render()
-if _, err := resolver.DownloadArtifact(coord, libsDir); err != nil {
-ui.Warn("No se pudo descargar %s: %v", coord, err)
-}
-}
-pb.Finish()
-return nil
+	pb := ui.NewProgressBar(len(allCoords), "Descargando ")
+	for i, coord := range allCoords {
+		pb.Current = i + 1
+		pb.Render()
+		if _, err := resolver.DownloadArtifact(coord, libsDir); err != nil {
+			pb.Finish()
+			return fmt.Errorf("no se pudo descargar %s: %w", coord, err)
+		}
+	}
+	pb.Finish()
+	return nil
 }
 
 func cmdClean(args []string) {
