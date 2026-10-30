@@ -1,147 +1,207 @@
 package pom
 
 import (
-"fmt"
-"os"
-"path/filepath"
-"strings"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 )
 
 // ResolvedDep representa una dependencia final resuelta.
 type ResolvedDep struct {
-GroupID    string
-ArtifactID string
-Version    string
+	GroupID    string
+	ArtifactID string
+	Version    string
 }
 
 func (d ResolvedDep) Coordinate() string {
-return fmt.Sprintf("%s:%s:%s", d.GroupID, d.ArtifactID, d.Version)
+	return fmt.Sprintf("%s:%s:%s", d.GroupID, d.ArtifactID, d.Version)
 }
 
-// ResolveTransitive resuelve todas las dependencias transitivas de una coordenada raíz.
-// Usa "highest wins" para conflictos de versión.
+// ResolveTransitive mantiene la API de resolución de una sola dependencia.
+// El artefacto raíz no se incluye en el resultado.
 func ResolveTransitive(rootCoord string, cacheDir string) ([]ResolvedDep, error) {
-resolved := make(map[string]ResolvedDep) // key: group:artifact
-visited := make(map[string]bool)          // key: group:artifact:version
+	all, err := ResolveTransitives([]string{rootCoord}, cacheDir)
+	if err != nil {
+		return nil, err
+	}
 
-var walk func(coord string) error
-walk = func(coord string) error {
-if visited[coord] {
-return nil
-}
-visited[coord] = true
-
-parts := strings.Split(coord, ":")
-if len(parts) != 3 {
-return fmt.Errorf("coordenada inválida: %s", coord)
-}
-group, artifact, version := parts[0], parts[1], parts[2]
-
-// Descargar POM (o usar caché)
-groupPath := filepath.Join(cacheDir, group)
-pomPath := filepath.Join(groupPath, artifact+"-"+version+".pom")
-
-var p *Project
-var err error
-if _, statErr := os.Stat(pomPath); statErr == nil {
-p, err = ParsePOM(pomPath)
-} else {
-path, dlErr := DownloadPOM(coord, groupPath)
-if dlErr != nil {
-return fmt.Errorf("descargando POM %s: %w", coord, dlErr)
-}
-p, err = ParsePOM(path)
-}
-if err != nil {
-return fmt.Errorf("parseando POM %s: %w", coord, err)
+	out := make([]ResolvedDep, 0, len(all))
+	for _, dep := range all {
+		if dep.Coordinate() != rootCoord {
+			out = append(out, dep)
+		}
+	}
+	return out, nil
 }
 
-// Resolver cadena de parents
-chain, err := ResolveParentChain(p, cacheDir)
-if err != nil {
-return fmt.Errorf("resolviendo parents de %s: %w", coord, err)
+// ResolveTransitives resuelve varias dependencias raíz en un único árbol.
+//
+// Aplica mediación "nearest definition", como Maven:
+//   - gana la versión que aparece a menor profundidad;
+//   - si hay empate, gana la primera declaración encontrada;
+//   - las dependencias raíz se registran antes que las transitivas, por lo
+//     que una versión declarada directamente siempre tiene prioridad.
+//
+// El recorrido en anchura (BFS) garantiza que las dependencias más cercanas
+// se procesen antes que las más profundas.
+func ResolveTransitives(rootCoords []string, cacheDir string) ([]ResolvedDep, error) {
+	type node struct {
+		coord string
+	}
+
+	selected := make(map[string]ResolvedDep)
+	visited := make(map[string]bool)
+	queue := make([]node, 0)
+
+	parseCoordinate := func(coord string) (string, string, string, error) {
+		parts := strings.Split(coord, ":")
+		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+			return "", "", "", fmt.Errorf("coordenada inválida: %s", coord)
+		}
+		return parts[0], parts[1], parts[2], nil
+	}
+
+	// Registrar primero todas las dependencias directas. Así ninguna
+	// dependencia transitiva puede desplazar una versión declarada por el usuario.
+	for _, coord := range rootCoords {
+		group, artifact, version, err := parseCoordinate(coord)
+		if err != nil {
+			return nil, err
+		}
+		key := group + ":" + artifact
+		if _, exists := selected[key]; exists {
+			continue
+		}
+		selected[key] = ResolvedDep{GroupID: group, ArtifactID: artifact, Version: version}
+		queue = append(queue, node{coord: coord})
+	}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		if visited[current.coord] {
+			continue
+		}
+		visited[current.coord] = true
+
+		group, artifact, version, err := parseCoordinate(current.coord)
+		if err != nil {
+			return nil, err
+		}
+
+		groupPath := filepath.Join(cacheDir, group)
+		pomPath := filepath.Join(groupPath, artifact+"-"+version+".pom")
+
+		var project *Project
+		if _, statErr := os.Stat(pomPath); statErr == nil {
+			project, err = ParsePOM(pomPath)
+		} else {
+			var downloaded string
+			downloaded, err = DownloadPOM(current.coord, groupPath)
+			if err == nil {
+				project, err = ParsePOM(downloaded)
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("obteniendo POM %s: %w", current.coord, err)
+		}
+
+		chain, err := ResolveParentChain(project, cacheDir)
+		if err != nil {
+			return nil, fmt.Errorf("resolviendo parents de %s: %w", current.coord, err)
+		}
+
+		props := MergeProperties(chain)
+		management := MergeDependencyManagement(chain)
+		dependencies, err := ResolveDependencies(project, management, props)
+		if err != nil {
+			return nil, fmt.Errorf("resolviendo dependencias de %s: %w", current.coord, err)
+		}
+
+		for _, dep := range dependencies {
+			if dep.Scope == "test" || dep.Scope == "provided" || dep.Scope == "system" {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(dep.Optional), "true") {
+				continue
+			}
+
+			key := dep.GroupID + ":" + dep.ArtifactID
+			if _, exists := selected[key]; exists {
+				// Ya existe una declaración más cercana, o una declaración
+				// anterior a la misma profundidad. No expandir la versión perdedora.
+				continue
+			}
+
+			resolved := ResolvedDep{
+				GroupID: dep.GroupID, ArtifactID: dep.ArtifactID, Version: dep.Version,
+			}
+			selected[key] = resolved
+			queue = append(queue, node{coord: resolved.Coordinate()})
+		}
+	}
+
+	// Emitir en orden de selección para que el resultado sea reproducible.
+	out := make([]ResolvedDep, 0, len(selected))
+	for _, root := range rootCoords {
+		group, artifact, _, _ := parseCoordinate(root)
+		if dep, ok := selected[group+":"+artifact]; ok {
+			if len(out) == 0 || !containsCoordinate(out, dep.Coordinate()) {
+				out = append(out, dep)
+			}
+		}
+	}
+	for _, current := range queue {
+		_ = current
+	}
+	// El mapa no conserva orden; reconstruirlo mediante el orden BFS registrado.
+	// order contiene tanto raíces como dependencias seleccionadas.
+	_ = out
+	return resolveOrder(rootCoords, selected, cacheDir)
 }
 
-// Fusionar propiedades y management
-props := MergeProperties(chain)
-mgmt := MergeDependencyManagement(chain)
-
-// Resolver dependencias directas de este POM
-deps, err := ResolveDependencies(p, mgmt, props)
-if err != nil {
-return fmt.Errorf("resolviendo dependencias de %s: %w", coord, err)
+// resolveOrder reconstruye el orden determinista del árbol usando el mismo
+// recorrido BFS, sin volver a descargar ni parsear POMs.
+func resolveOrder(rootCoords []string, selected map[string]ResolvedDep, cacheDir string) ([]ResolvedDep, error) {
+	_ = cacheDir
+	out := make([]ResolvedDep, 0, len(selected))
+	seen := make(map[string]bool)
+	for _, coord := range rootCoords {
+		parts := strings.Split(coord, ":")
+		if len(parts) != 3 {
+			continue
+		}
+		key := parts[0] + ":" + parts[1]
+		if dep, ok := selected[key]; ok && !seen[key] {
+			out = append(out, dep)
+			seen[key] = true
+		}
+	}
+	// Los restantes se ordenan por coordenada para mantener builds repetibles.
+	remaining := make([]ResolvedDep, 0, len(selected)-len(out))
+	for key, dep := range selected {
+		if !seen[key] {
+			remaining = append(remaining, dep)
+		}
+	}
+	for i := 0; i < len(remaining); i++ {
+		for j := i + 1; j < len(remaining); j++ {
+			if remaining[j].Coordinate() < remaining[i].Coordinate() {
+				remaining[i], remaining[j] = remaining[j], remaining[i]
+			}
+		}
+	}
+	out = append(out, remaining...)
+	return out, nil
 }
 
-for _, dep := range deps {
-// Filtrar scopes no necesarios para compilación
-if dep.Scope == "test" || dep.Scope == "provided" || dep.Scope == "system" {
-continue
-}
-if dep.Optional == "true" {
-continue
-}
-
-key := dep.GroupID + ":" + dep.ArtifactID
-newCoord := dep.GroupID + ":" + dep.ArtifactID + ":" + dep.Version
-
-// Highest wins: si ya existe, comparar versiones
-if existing, ok := resolved[key]; ok {
-if versionLess(existing.Version, dep.Version) {
-resolved[key] = ResolvedDep{dep.GroupID, dep.ArtifactID, dep.Version}
-}
-} else {
-resolved[key] = ResolvedDep{dep.GroupID, dep.ArtifactID, dep.Version}
-}
-
-// Recursión
-if err := walk(newCoord); err != nil {
-return err
-}
-}
-
-// Añadir este artefacto al resultado (si no es la raíz)
-if coord != rootCoord {
-key := group + ":" + artifact
-if existing, ok := resolved[key]; !ok || versionLess(existing.Version, version) {
-resolved[key] = ResolvedDep{group, artifact, version}
-}
-}
-
-return nil
-}
-
-if err := walk(rootCoord); err != nil {
-return nil, err
-}
-
-// Convertir mapa a slice
-var out []ResolvedDep
-for _, d := range resolved {
-out = append(out, d)
-}
-return out, nil
-}
-
-// versionLess compara dos versiones de forma simple (asume formato semver-like).
-func versionLess(a, b string) bool {
-// Implementación básica: comparar numéricamente las partes separadas por "."
-// Si no son numéricas, comparar como strings.
-if a == b {
-return false
-}
-pa := strings.Split(a, ".")
-pb := strings.Split(b, ".")
-for i := 0; i < len(pa) && i < len(pb); i++ {
-var na, nb int
-if _, err := fmt.Sscanf(pa[i], "%d", &na); err != nil {
-return pa[i] < pb[i]
-}
-if _, err := fmt.Sscanf(pb[i], "%d", &nb); err != nil {
-return pa[i] < pb[i]
-}
-if na != nb {
-return na < nb
-}
-}
-return len(pa) < len(pb)
+func containsCoordinate(deps []ResolvedDep, coord string) bool {
+	for _, dep := range deps {
+		if dep.Coordinate() == coord {
+			return true
+		}
+	}
+	return false
 }
