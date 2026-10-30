@@ -1,198 +1,228 @@
 package resolver
 
 import (
-"archive/zip"
-"fmt"
-"io"
-"net/http"
-"os"
-"path/filepath"
-"strings"
+	"archive/zip"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
 )
 
 var repositories = []string{
-"https://dl.google.com/dl/android/maven2",
-"https://repo1.maven.org/maven2",
+	"https://dl.google.com/dl/android/maven2",
+	"https://repo.maven.apache.org/maven2",
+	"https://repo1.maven.org/maven2",
+}
+
+var artifactHTTPClient = &http.Client{Timeout: 45 * time.Second}
+
+// fetchArtifact intenta descargar un artefacto desde los repositorios configurados.
+// Los 404 pasan al siguiente repositorio; los 429 y errores temporales se reintentan.
+func fetchArtifact(url string) (string, error) {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("User-Agent", "Rain-Android-Builder/1.0")
+
+		resp, err := artifactHTTPClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("error de red: %w", err)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			status := resp.StatusCode
+			retryAfter := resp.Header.Get("Retry-After")
+			resp.Body.Close()
+			lastErr = fmt.Errorf("HTTP %d en %s", status, url)
+
+			if status == http.StatusTooManyRequests || status >= 500 {
+				delay := 700 * time.Millisecond
+				if retryAfter != "" {
+					if seconds, parseErr := time.ParseDuration(retryAfter + "s"); parseErr == nil {
+						delay = seconds
+					}
+				}
+				time.Sleep(delay)
+				continue
+			}
+			return "", lastErr
+		}
+
+		tmp, err := os.CreateTemp("", "rain-artifact-*")
+		if err != nil {
+			resp.Body.Close()
+			return "", err
+		}
+		_, copyErr := io.Copy(tmp, resp.Body)
+		resp.Body.Close()
+		closeErr := tmp.Close()
+		if copyErr != nil {
+			os.Remove(tmp.Name())
+			return "", copyErr
+		}
+		if closeErr != nil {
+			os.Remove(tmp.Name())
+			return "", closeErr
+		}
+		return tmp.Name(), nil
+	}
+	return "", lastErr
 }
 
 // DownloadAAR descarga un AAR de los repositorios y extrae classes.jar.
 func DownloadAAR(coordinate string, destDir string) (string, error) {
-parts := strings.Split(coordinate, ":")
-if len(parts) != 3 {
-return "", fmt.Errorf("coordenada inválida: %s", coordinate)
-}
-group, artifact, version := parts[0], parts[1], parts[2]
-groupPath := strings.ReplaceAll(group, ".", "/")
+	parts := strings.Split(coordinate, ":")
+	if len(parts) != 3 {
+		return "", fmt.Errorf("coordenada inválida: %s", coordinate)
+	}
+	group, artifact, version := parts[0], parts[1], parts[2]
+	groupPath := strings.ReplaceAll(group, ".", "/")
 
-var lastErr error
-for _, repo := range repositories {
-url := fmt.Sprintf("%s/%s/%s/%s/%s-%s.aar",
-repo, groupPath, artifact, version, artifact, version)
+	var lastErr error
+	for _, repo := range repositories {
+		url := fmt.Sprintf("%s/%s/%s/%s/%s-%s.aar", repo, groupPath, artifact, version, artifact, version)
+		tmpAAR, err := fetchArtifact(url)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if err := os.MkdirAll(destDir, 0755); err != nil {
+			os.Remove(tmpAAR)
+			return "", err
+		}
 
-resp, err := http.Get(url)
-if err != nil {
-lastErr = fmt.Errorf("error de red en %s: %w", repo, err)
-continue
-}
-if resp.StatusCode != http.StatusOK {
-resp.Body.Close()
-lastErr = fmt.Errorf("HTTP %d en %s", resp.StatusCode, url)
-continue
-}
+		zr, err := zip.OpenReader(tmpAAR)
+		if err != nil {
+			os.Remove(tmpAAR)
+			lastErr = fmt.Errorf("AAR no es ZIP válido: %w", err)
+			continue
+		}
 
-if err := os.MkdirAll(destDir, 0755); err != nil {
-resp.Body.Close()
-return "", err
-}
-tmpAAR := filepath.Join(destDir, artifact+"-"+version+".aar")
-f, err := os.Create(tmpAAR)
-if err != nil {
-resp.Body.Close()
-return "", err
-}
-_, copyErr := io.Copy(f, resp.Body)
-resp.Body.Close()
-f.Close()
-if copyErr != nil {
-lastErr = copyErr
-continue
-}
+		classesJarPath := ""
+		for _, zf := range zr.File {
+			if zf.Name != "classes.jar" {
+				continue
+			}
+			classesJarPath = filepath.Join(destDir, artifact+"-"+version+"-classes.jar")
+			out, createErr := os.Create(classesJarPath)
+			if createErr != nil {
+				zr.Close()
+				os.Remove(tmpAAR)
+				return "", createErr
+			}
+			rc, openErr := zf.Open()
+			if openErr != nil {
+				out.Close()
+				zr.Close()
+				os.Remove(tmpAAR)
+				return "", openErr
+			}
+			_, copyErr := io.Copy(out, rc)
+			rc.Close()
+			out.Close()
+			if copyErr != nil {
+				zr.Close()
+				os.Remove(tmpAAR)
+				return "", copyErr
+			}
+			break
+		}
+		zr.Close()
+		os.Remove(tmpAAR)
 
-// Extraer classes.jar
-zr, err := zip.OpenReader(tmpAAR)
-if err != nil {
-os.Remove(tmpAAR)
-lastErr = fmt.Errorf("AAR no es ZIP válido: %w", err)
-continue
-}
-
-classesJarPath := ""
-for _, zf := range zr.File {
-if zf.Name == "classes.jar" {
-classesJarPath = filepath.Join(destDir, artifact+"-"+version+"-classes.jar")
-out, err := os.Create(classesJarPath)
-if err != nil {
-zr.Close()
-return "", err
-}
-rc, err := zf.Open()
-if err != nil {
-out.Close()
-zr.Close()
-return "", err
-}
-io.Copy(out, rc)
-rc.Close()
-out.Close()
-break
-}
-}
-zr.Close()
-os.Remove(tmpAAR)
-
-if classesJarPath == "" {
-lastErr = fmt.Errorf("classes.jar no encontrado en %s", url)
-continue
-}
-return classesJarPath, nil
+		if classesJarPath != "" {
+			return classesJarPath, nil
+		}
+		lastErr = fmt.Errorf("classes.jar no encontrado en AAR")
+	}
+	return "", fmt.Errorf("no se encontró AAR para %s (último error: %v)", coordinate, lastErr)
 }
 
-return "", fmt.Errorf("no se encontró AAR para %s (último error: %v)", coordinate, lastErr)
-}
-
-// DownloadArtifact descarga un artefacto (AAR o JAR) y devuelve la ruta a usar en el classpath.
-// Si es AAR, extrae classes.jar; si es JAR, lo guarda directamente.
+// DownloadArtifact descarga un artefacto y devuelve la ruta para el classpath.
+// Prueba JAR antes que AAR porque la mayoría de las dependencias Maven son JAR.
+// Si no existe como JAR, intenta AAR y extrae classes.jar.
 func DownloadArtifact(coordinate string, destDir string) (string, error) {
-parts := strings.Split(coordinate, ":")
-if len(parts) != 3 {
-return "", fmt.Errorf("coordenada inválida: %s", coordinate)
-}
-group, artifact, version := parts[0], parts[1], parts[2]
-groupPath := strings.ReplaceAll(group, ".", "/")
+	parts := strings.Split(coordinate, ":")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		return "", fmt.Errorf("coordenada inválida: %s", coordinate)
+	}
+	group, artifact, version := parts[0], parts[1], parts[2]
+	groupPath := strings.ReplaceAll(group, ".", "/")
 
-if err := os.MkdirAll(destDir, 0755); err != nil {
-return "", err
-}
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return "", err
+	}
 
-// Probar primero AAR, luego JAR
-for _, ext := range []string{"aar", "jar"} {
-var lastErr error
-for _, repo := range repositories {
-url := fmt.Sprintf("%s/%s/%s/%s/%s-%s.%s",
-repo, groupPath, artifact, version, artifact, version, ext)
+	var errorsFound []string
+	for _, ext := range []string{"jar", "aar"} {
+		for _, repo := range repositories {
+			url := fmt.Sprintf("%s/%s/%s/%s/%s-%s.%s", repo, groupPath, artifact, version, artifact, version, ext)
+			tmpPath, err := fetchArtifact(url)
+			if err != nil {
+				errorsFound = append(errorsFound, err.Error())
+				continue
+			}
 
-resp, err := http.Get(url)
-if err != nil {
-lastErr = fmt.Errorf("error de red: %w", err)
-continue
-}
-if resp.StatusCode != http.StatusOK {
-resp.Body.Close()
-lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
-continue
-}
+			destPath := filepath.Join(destDir, fmt.Sprintf("%s-%s.%s", artifact, version, ext))
+			if err := os.Rename(tmpPath, destPath); err != nil {
+				os.Remove(tmpPath)
+				return "", err
+			}
 
-tmpPath := filepath.Join(destDir, fmt.Sprintf("%s-%s.%s", artifact, version, ext))
-f, err := os.Create(tmpPath)
-if err != nil {
-resp.Body.Close()
-return "", err
-}
-_, copyErr := io.Copy(f, resp.Body)
-resp.Body.Close()
-f.Close()
-if copyErr != nil {
-os.Remove(tmpPath)
-lastErr = copyErr
-continue
-}
+			if ext == "jar" {
+				return destPath, nil
+			}
 
-if ext == "jar" {
-return tmpPath, nil
-}
+			zr, err := zip.OpenReader(destPath)
+			if err != nil {
+				os.Remove(destPath)
+				errorsFound = append(errorsFound, fmt.Sprintf("AAR inválido: %v", err))
+				continue
+			}
 
-// Es AAR, extraer classes.jar
-zr, err := zip.OpenReader(tmpPath)
-if err != nil {
-os.Remove(tmpPath)
-lastErr = err
-continue
-}
+			classesJarPath := filepath.Join(destDir, artifact+"-"+version+"-classes.jar")
+			found := false
+			for _, zf := range zr.File {
+				if zf.Name != "classes.jar" {
+					continue
+				}
+				out, createErr := os.Create(classesJarPath)
+				if createErr != nil {
+					zr.Close()
+					return "", createErr
+				}
+				rc, openErr := zf.Open()
+				if openErr != nil {
+					out.Close()
+					zr.Close()
+					return "", openErr
+				}
+				_, copyErr := io.Copy(out, rc)
+				rc.Close()
+				out.Close()
+				if copyErr != nil {
+					zr.Close()
+					return "", copyErr
+				}
+				found = true
+				break
+			}
+			zr.Close()
+			os.Remove(destPath)
+			if found {
+				return classesJarPath, nil
+			}
+			errorsFound = append(errorsFound, "classes.jar no encontrado en AAR")
+		}
+	}
 
-classesJarPath := filepath.Join(destDir, artifact+"-"+version+"-classes.jar")
-var found bool
-for _, zf := range zr.File {
-if zf.Name == "classes.jar" {
-out, err := os.Create(classesJarPath)
-if err != nil {
-zr.Close()
-return "", err
-}
-rc, err := zf.Open()
-if err != nil {
-out.Close()
-zr.Close()
-return "", err
-}
-io.Copy(out, rc)
-rc.Close()
-out.Close()
-found = true
-break
-}
-}
-zr.Close()
-os.Remove(tmpPath)
-
-if found {
-return classesJarPath, nil
-}
-lastErr = fmt.Errorf("classes.jar no encontrado en AAR")
-}
-if lastErr != nil {
-// Continuar con el siguiente ext
-}
-}
-
-return "", fmt.Errorf("no se encontró AAR ni JAR para %s", coordinate)
+	return "", fmt.Errorf("no se encontró JAR ni AAR para %s: %s", coordinate, strings.Join(errorsFound, "; "))
 }
