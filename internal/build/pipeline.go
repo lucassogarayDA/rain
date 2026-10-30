@@ -4,6 +4,7 @@ import (
 "bytes"
 "crypto/sha256"
 "fmt"
+"hash"
 "io"
 "os"
 "os/exec"
@@ -39,79 +40,141 @@ return nil, err
 return h.Sum(nil), nil
 }
 
-func computeResourceHash(appDir string) (string, error) {
-var files []string
-resDir := filepath.Join(appDir, "src/main/res")
-manifest := filepath.Join(appDir, "src/main/AndroidManifest.xml")
-
-if err := filepath.Walk(resDir, func(path string, info os.FileInfo, err error) error {
-if err != nil {
-return err
-}
-if info == nil {
-return fmt.Errorf("información de archivo vacía para %s", path)
-}
-if !info.IsDir() {
-files = append(files, path)
-}
-return nil
-}); err != nil {
-return "", fmt.Errorf("recorriendo recursos %s: %w", resDir, err)
-}
-if _, err := os.Stat(manifest); err == nil {
-files = append(files, manifest)
-}
-sort.Strings(files)
-
-global := sha256.New()
-for _, f := range files {
-h, err := hashFile(f)
-if err != nil {
-return "", err
-}
-global.Write(h)
-global.Write([]byte(filepath.Base(f)))
-}
-return fmt.Sprintf("%x", global.Sum(nil)), nil
+func writeFileHash(h hash.Hash, name, path string) error {
+	sum, err := hashFile(path)
+	if err != nil {
+		return fmt.Errorf("hasheando %s: %w", path, err)
+	}
+	_, _ = h.Write([]byte(name))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write(sum)
+	_, _ = h.Write([]byte{0})
+	return nil
 }
 
-func computeJavaHash(appDir, libsDir, genDir string, release bool) (string, error) {
-var files []string
-filepath.Walk(filepath.Join(appDir, "src/main"), func(path string, info os.FileInfo, err error) error {
-if strings.HasSuffix(path, ".java") || strings.HasSuffix(path, ".kt") {
-files = append(files, path)
-}
-return nil
-})
-filepath.Walk(genDir, func(path string, info os.FileInfo, err error) error {
-if strings.HasSuffix(path, ".java") {
-files = append(files, path)
-}
-return nil
-})
-entries, _ := os.ReadDir(libsDir)
-for _, e := range entries {
-if strings.HasSuffix(e.Name(), ".jar") {
-files = append(files, filepath.Join(libsDir, e.Name()))
-}
-}
-sort.Strings(files)
+func computeResourceHash(appDir, androidJar string) (string, error) {
+	var files []string
+	resDir := filepath.Join(appDir, "src/main/res")
+	manifest := filepath.Join(appDir, "src/main/AndroidManifest.xml")
 
-global := sha256.New()
-if release {
-global.Write([]byte("release"))
-} else {
-global.Write([]byte("debug"))
+	if err := filepath.Walk(resDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info == nil {
+			return fmt.Errorf("información de archivo vacía para %s", path)
+		}
+		if !info.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	}); err != nil {
+		return "", fmt.Errorf("recorriendo recursos %s: %w", resDir, err)
+	}
+	sort.Strings(files)
+
+	global := sha256.New()
+	for _, file := range files {
+		rel, err := filepath.Rel(resDir, file)
+		if err != nil {
+			return "", err
+		}
+		if err := writeFileHash(global, filepath.ToSlash(rel), file); err != nil {
+			return "", err
+		}
+	}
+
+	if err := writeFileHash(global, "AndroidManifest.xml", manifest); err != nil {
+		return "", fmt.Errorf("hash del manifest: %w", err)
+	}
+	if err := writeFileHash(global, "android.jar", androidJar); err != nil {
+		return "", fmt.Errorf("hash de android.jar para recursos: %w", err)
+	}
+	return fmt.Sprintf("%x", global.Sum(nil)), nil
 }
-for _, f := range files {
-h, err := hashFile(f)
-if err != nil {
-return "", err
-}
-global.Write(h)
-global.Write([]byte(filepath.Base(f)))
-}
-return fmt.Sprintf("%x", global.Sum(nil)), nil
+
+func computeJavaHash(appDir, libsDir, genDir, androidJar string, release bool) (string, error) {
+	global := sha256.New()
+	if release {
+		_, _ = global.Write([]byte("release"))
+	} else {
+		_, _ = global.Write([]byte("debug"))
+	}
+	_, _ = global.Write([]byte("kotlinc-jvm-target=1.8;javac-source=8;javac-target=8;d8-min-api=21"))
+	_, _ = global.Write([]byte{0})
+
+	var sources []string
+	srcDir := filepath.Join(appDir, "src/main")
+	if err := filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info == nil {
+			return fmt.Errorf("información de archivo vacía para %s", path)
+		}
+		if !info.IsDir() && (strings.HasSuffix(path, ".java") || strings.HasSuffix(path, ".kt")) {
+			sources = append(sources, path)
+		}
+		return nil
+	}); err != nil {
+		return "", fmt.Errorf("recorriendo fuentes %s: %w", srcDir, err)
+	}
+	sort.Strings(sources)
+	for _, file := range sources {
+		rel, err := filepath.Rel(appDir, file)
+		if err != nil {
+			return "", err
+		}
+		if err := writeFileHash(global, "source/"+filepath.ToSlash(rel), file); err != nil {
+			return "", err
+		}
+	}
+
+	var generated []string
+	if err := filepath.Walk(genDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info == nil {
+			return fmt.Errorf("información de archivo vacía para %s", path)
+		}
+		if !info.IsDir() && strings.HasSuffix(path, ".java") {
+			generated = append(generated, path)
+		}
+		return nil
+	}); err != nil {
+		return "", fmt.Errorf("recorriendo fuentes generadas %s: %w", genDir, err)
+	}
+	sort.Strings(generated)
+	for _, file := range generated {
+		rel, err := filepath.Rel(genDir, file)
+		if err != nil {
+			return "", err
+		}
+		if err := writeFileHash(global, "generated/"+filepath.ToSlash(rel), file); err != nil {
+			return "", err
+		}
+	}
+
+	entries, err := os.ReadDir(libsDir)
+	if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("leyendo bibliotecas %s: %w", libsDir, err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".jar") {
+			continue
+		}
+		file := filepath.Join(libsDir, entry.Name())
+		if err := writeFileHash(global, "library/"+entry.Name(), file); err != nil {
+			return "", err
+		}
+	}
+
+	if err := writeFileHash(global, "android.jar", androidJar); err != nil {
+		return "", fmt.Errorf("hash de android.jar: %w", err)
+	}
+
+	return fmt.Sprintf("%x", global.Sum(nil)), nil
 }
 
 func Run(cfg Config) error {
@@ -130,7 +193,7 @@ resHashPath := filepath.Join(cfg.BuildDir, ".rain-res-hash")
 flatDir := filepath.Join(cfg.BuildDir, "res")
 baseApk := filepath.Join(cfg.BuildDir, "base.apk")
 
-currentResHash, err := computeResourceHash(cfg.AppDir)
+currentResHash, err := computeResourceHash(cfg.AppDir, cfg.AndroidJar)
 if err != nil {
 return fmt.Errorf("hash de recursos: %w", err)
 }
@@ -214,7 +277,7 @@ return fmt.Errorf("generando BuildConfig: %w", err)
 javaHashPath := filepath.Join(cfg.BuildDir, ".rain-java-hash")
 dexPath := filepath.Join(cfg.BuildDir, "dex", "classes.dex")
 
-currentJavaHash, err := computeJavaHash(cfg.AppDir, cfg.LibsDir, genDir, cfg.Release)
+currentJavaHash, err := computeJavaHash(cfg.AppDir, cfg.LibsDir, genDir, cfg.AndroidJar, cfg.Release)
 if err != nil {
 return fmt.Errorf("hash de java: %w", err)
 }
